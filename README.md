@@ -1,6 +1,6 @@
 # Open-Vocabulary Gaze Object Prediction
 
-Official repository for **Open-Vocabulary Gaze Object Prediction: Benchmark and Method**, accepted by **ACM Multimedia 2026**.
+Official repository for **[Open-Vocabulary Gaze Object Prediction: Benchmark and Method](https://arxiv.org/abs/2607.18827)**, accepted by **ACM Multimedia 2026**.
 
 We introduce **DiSG (Diverse Scenes for Gaze Object Prediction)**, a real-image benchmark for open-vocabulary gaze object prediction, with diverse human-centric scenes, object categories, and fine-grained body-part categories. Together with an novel **OVGOP framework** for localizing and recognizing gaze targets under a free-form category vocabulary. This project provides:
 
@@ -9,6 +9,7 @@ We introduce **DiSG (Diverse Scenes for Gaze Object Prediction)**, a real-image 
 - Model weights of various previous GOP methods for DiSG.
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2607.18827"> Paper</a> ·
   <a href="#disg-dataset"> DiSG Dataset</a> ·
   <a href="#code-and-model-weights"> Code and Model Weights</a> ·
   <a href="#citation"> Citation</a> ·
