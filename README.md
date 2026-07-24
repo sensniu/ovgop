@@ -105,3 +105,6 @@ The following components will be released as soon as possible:
 }
 
 ```
+
+## Awesome-list of GOP
+- [Awesome list of Human-Centered Relationship Understanding](https://github.com/yangyang9912/Awesome-Human-Centered-Relationship), including [Methods](https://github.com/yangyang9912/Awesome-Human-Centered-Relationship#c-gaze-object-prediction-gop) and [Benchmarks](https://github.com/yangyang9912/Awesome-Human-Centered-Relationship#gaze-object-prediction) of gaze object prediction.
