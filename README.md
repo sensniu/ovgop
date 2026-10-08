@@ -89,6 +89,10 @@ Bounding boxes use the COCO convention `[x, y, width, height]`, and all coordina
 
 ## OVGOP Framework
 
+<p align="center">
+  <img src="assets/Architecture.png" alt="Architecture of the OVGOP framework" width="100%">
+</p>
+
 ### Environment Setup
 
 The model requires an NVIDIA GPU, Python 3.7.11, PyTorch 1.10.0, torchvision 0.11.1, and CUDA Toolkit 11.3. Run all installation, compilation, training, and evaluation commands from the `ovgop/` subdirectory.
