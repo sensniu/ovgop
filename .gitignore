@@ -219,3 +219,31 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# OVGOP training, evaluation, and inference artifacts
+outputs/
+checkpoints/
+tensorboard/
+runs/
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+prediction.json
+*.heatmap.npy
+
+# Model download and CUDA caches
+.huggingface/
+.nv/
+*.o
+*.obj
+*.dylib
+
+# Local Codex state and caches
+.codex/
+.codex-cache/
+codex-cache/
+
+# macOS metadata
+.DS_Store
+._*

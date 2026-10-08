@@ -1,0 +1,1023 @@
+# ------------------------------------------------------------------------
+# DINO
+# Copyright (c) 2022 IDEA. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+# Conditional DETR model and criterion classes.
+# Copyright (c) 2021 Microsoft. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+# Modified from DETR (https://github.com/facebookresearch/detr)
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
+# ------------------------------------------------------------------------
+# Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
+# Copyright (c) 2020 SenseTime. All Rights Reserved.
+# ------------------------------------------------------------------------
+import copy
+import math
+from typing import List
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torchvision.ops.boxes import nms
+import numpy as np
+from util import box_ops
+from util.gaze_direction import direction_pixels, nearest_direction_angle
+from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
+                       accuracy, get_world_size, interpolate,
+                       is_dist_avail_and_initialized, inverse_sigmoid)
+from .transformer import build_transformer
+from .clip_align import build_classifier
+from .backbone import build_backbone
+from .matcher import build_matcher
+from .gatector import build_gatector
+from .utils import sigmoid_focal_loss, MLP, ContrastiveEmbed    #, get_tokenlizer
+from util import get_tokenlizer
+
+from ..registry import MODULE_BUILD_FUNCS
+from models.clip import clip
+from models.clip.clip import _MODELS, _download, available_models
+import os
+
+from .bertwarper import (
+    BertModelWarper,
+    generate_masks_with_special_tokens,
+    generate_masks_with_special_tokens_and_transfer_map,
+)
+
+
+
+CUSTOM_TEMPLATES = {
+    "direction": 'A photo of a face gazing {}.',
+    "categories": 'A photo of a {}.'
+}
+
+def load_clip_to_cpu(args):
+    model_path = args.model_path
+    name = args.head_backbone
+    if "clip" in name:
+        name = name.replace('clip_', '')
+    if not model_path:
+        if name in _MODELS:
+            model_path = _download(_MODELS[name], os.path.expanduser("~/.cache/clip"))
+        elif os.path.isfile(name):
+            model_path = name
+        else:
+            raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
+
+    with open(model_path, 'rb') as opened_file:
+        model = torch.jit.load(opened_file, map_location="cpu")
+        state_dict = model.state_dict()
+
+    model = clip.build_model(state_dict or model.state_dict())
+
+    return model
+
+class TextEncoder(nn.Module):
+
+    def __init__(self, clip_model):
+        super().__init__()
+        self.clip_model = clip_model
+        self.dtype = clip_model.dtype
+
+    def forward(self, classnames):
+        if len(classnames) == 8:
+            temp = CUSTOM_TEMPLATES['direction']
+        else:
+            temp = CUSTOM_TEMPLATES['categories']
+        prompts = [temp.format(c) for c in classnames]
+        prompts = torch.cat([clip.tokenize(p) for p in prompts])
+        prompts = prompts.to('cuda')
+        text_features = self.clip_model.encode_text(prompts)
+        x = text_features # (8, 1024)
+        return x
+
+
+def find_nearest(degree):
+    return nearest_direction_angle(degree)
+
+def get_head_direction_channel(head_channels, direction_cls, gt_clses, cls_probs):
+    head_direction_channels = []
+    has_ground_truth = gt_clses is not None and len(gt_clses) > 0
+    for index, (head_channel, direction_id, cls_prob) in enumerate(
+        zip(head_channels, direction_cls, cls_probs)
+    ):
+        direction_id = int(direction_id)
+        if has_ground_truth:
+            draw_direction = direction_id == int(gt_clses[index])
+        else:
+            draw_direction = bool(cls_prob[direction_id] > 0.5)
+
+        if draw_direction:
+            _, height, width = head_channel.shape
+            rows = torch.nonzero(head_channel.sum(dim=2).flatten(), as_tuple=True)[0]
+            cols = torch.nonzero(head_channel.sum(dim=1).flatten(), as_tuple=True)[0]
+            if rows.numel() and cols.numel():
+                center_y = int((rows.min() + rows.max()) // 2)
+                center_x = int((cols.min() + cols.max()) // 2)
+                for x, y in direction_pixels(center_x, center_y, width, height, direction_id):
+                    head_channel[:, y, x] = 1
+        head_direction_channels.append(head_channel)
+
+    return torch.stack(head_direction_channels, 0)
+
+class scene_Adapter(nn.Module):
+    def __init__(self, c_in, reduction=2):
+        super(scene_Adapter, self).__init__()
+        self.conv_scene = nn.Sequential(
+            nn.Conv2d(in_channels=768, out_channels=1300, kernel_size=3),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(in_channels=1300, out_channels=2048, kernel_size=3),
+            nn.ReLU(inplace=True),
+
+        )
+
+        self.fc = nn.Sequential(
+
+            nn.Linear(c_in, c_in // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c_in // reduction, c_in // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c_in // reduction, c_in, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        scene_feates = self.conv_scene(x)
+
+        x = scene_feates.permute(0, 2, 3, 1)
+        x = self.fc(x)
+        x = x.permute(0, 3, 1, 2)
+        return x, scene_feates
+
+class face_Adapter(nn.Module):
+    def __init__(self, c_in, reduction=2):
+        super(face_Adapter, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(c_in, c_in // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c_in // reduction, c_in, bias=False),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.fc(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
+class DINO(nn.Module):
+    """ This is the Cross-Attention Detector module that performs object detection """
+    def __init__(
+            self,
+            args,
+            backbone,
+            transformer,
+            gatector,
+            classnames,
+            num_queries,
+            aux_loss=False,
+            iter_update=False,
+            query_dim=2,
+            num_feature_levels=1,
+            nheads=8,
+            # two stage
+            two_stage_type="no",  # ['no', 'standard']
+            dec_pred_bbox_embed_share=True,
+            two_stage_class_embed_share=True,
+            two_stage_bbox_embed_share=True,
+            num_patterns=0,
+            text_encoder_type="bert-base-uncased",
+            sub_sentence_present=True,
+            max_text_len=256,
+            ):
+        """ Initializes the model.
+        Parameters:
+            backbone: torch module of the backbone to be used. See backbone.py
+            transformer: torch module of the transformer architecture. See transformer.py
+            num_classes: number of object classes
+            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
+                         Conditional DETR can detect in a single image. For COCO, we recommend 100 queries.
+            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+
+            fix_refpoints_hw: -1(default): learn w and h for each box seperately
+                                >0 : given fixed number
+                                -2 : learn a shared w and h
+        """
+        super().__init__()
+        self.num_queries = num_queries
+        self.gatector = gatector
+
+        self.transformer = transformer
+        self.hidden_dim = hidden_dim = transformer.d_model
+        self.num_feature_levels = num_feature_levels
+        self.nheads = nheads
+        self.max_text_len = 256
+        self.sub_sentence_present = sub_sentence_present
+
+        # setting query dim
+        self.query_dim = query_dim
+        assert query_dim == 4
+
+        self.num_patterns = num_patterns
+
+        # bert
+        self.tokenizer = get_tokenlizer.get_tokenlizer(text_encoder_type)
+        self.bert = get_tokenlizer.get_pretrained_language_model(text_encoder_type)
+        self.bert.pooler.dense.weight.requires_grad_(False)
+        self.bert.pooler.dense.bias.requires_grad_(False)
+        self.bert = BertModelWarper(bert_model=self.bert)
+
+        self.feat_map = nn.Linear(self.bert.config.hidden_size, self.hidden_dim, bias=True)
+        nn.init.constant_(self.feat_map.bias.data, 0)
+        nn.init.xavier_uniform_(self.feat_map.weight.data)
+        # freeze
+
+        # special tokens
+        self.specical_tokens = self.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
+
+
+
+        # prepare input projection layers
+        if num_feature_levels > 1:
+            num_backbone_outs = len(backbone.num_channels)
+            input_proj_list = []
+            for _ in range(num_backbone_outs):
+                in_channels = backbone.num_channels[_]
+                input_proj_list.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
+                        nn.GroupNorm(32, hidden_dim),
+                    )
+                )
+            for _ in range(num_feature_levels - num_backbone_outs):
+                input_proj_list.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),
+                        nn.GroupNorm(32, hidden_dim),
+                    )
+                )
+                in_channels = hidden_dim
+            self.input_proj = nn.ModuleList(input_proj_list)
+        else:
+            assert two_stage_type == 'no', "two_stage_type should be no if num_feature_levels=1 !!!"
+            self.input_proj = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(backbone.num_channels[-1], hidden_dim, kernel_size=1),
+                        nn.GroupNorm(32, hidden_dim),
+                    )
+                ]
+            )
+
+        self.backbone = backbone
+        self.aux_loss = aux_loss
+        self.box_pred_damping = box_pred_damping = None
+
+        self.iter_update = iter_update
+        assert iter_update, "Why not iter_update?"
+
+        # prepare pred layers
+        self.dec_pred_bbox_embed_share = dec_pred_bbox_embed_share
+        # prepare class & box embed
+        _class_embed = ContrastiveEmbed()
+
+        _bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        nn.init.constant_(_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)
+
+        if dec_pred_bbox_embed_share:
+            box_embed_layerlist = [_bbox_embed for i in range(transformer.num_decoder_layers)]
+        else:
+            box_embed_layerlist = [
+                copy.deepcopy(_bbox_embed) for i in range(transformer.num_decoder_layers)
+            ]
+        class_embed_layerlist = [_class_embed for i in range(transformer.num_decoder_layers)]
+        self.bbox_embed = nn.ModuleList(box_embed_layerlist)
+        self.class_embed = nn.ModuleList(class_embed_layerlist)
+        self.transformer.decoder.bbox_embed = self.bbox_embed
+        self.transformer.decoder.class_embed = self.class_embed
+
+        # two stage
+        self.two_stage_type = two_stage_type
+        assert two_stage_type in ['no', 'standard'], "unknown param {} of two_stage_type".format(two_stage_type)
+        if two_stage_type != 'no':
+            if two_stage_bbox_embed_share:
+                assert dec_pred_bbox_embed_share
+                self.transformer.enc_out_bbox_embed = _bbox_embed
+            else:
+                self.transformer.enc_out_bbox_embed = copy.deepcopy(_bbox_embed)
+    
+            if two_stage_class_embed_share:
+                assert dec_pred_bbox_embed_share
+                self.transformer.enc_out_class_embed = _class_embed
+            else:
+                self.transformer.enc_out_class_embed = copy.deepcopy(_class_embed)
+    
+            self.refpoint_embed = None
+
+        self._reset_parameters()
+
+        self.args = args
+        self.clip_model = load_clip_to_cpu(self.args).float()
+        self.image_encoder = self.clip_model.visual
+        self.scene_adapter = scene_Adapter(2048, 4)
+        self.face_adapter = face_Adapter(2048, 4)
+        self.head_classnames = classnames
+        self.text_encoder = build_classifier(args, classnames, CUSTOM_TEMPLATES)
+        self.temperature = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def _reset_parameters(self):
+        # init input_proj
+        for proj in self.input_proj:
+            nn.init.xavier_uniform_(proj[0].weight, gain=1)
+            nn.init.constant_(proj[0].bias, 0)
+
+    def set_image_tensor(self, samples: NestedTensor):
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        self.features, self.poss = self.backbone(samples)
+
+    def unset_image_tensor(self):
+        if hasattr(self, 'features'):
+            del self.features
+        if hasattr(self,'poss'):
+            del self.poss
+
+    def set_image_features(self, features , poss):
+        self.features = features
+        self.poss = poss
+
+
+    def init_ref_points(self, use_num_queries):
+        self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
+
+    def forward(self, samples: NestedTensor, categories, face, head_channel, targets:List=None, head_direction_clses=None, iter=0, captions=[], frozen_mode=False, **kw):
+        """ The forward expects a NestedTensor, which consists of:
+               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
+               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+
+            It returns a dict with the following elements:
+               - "pred_logits": the classification logits (including no-object) for all queries.
+                                Shape= [batch_size x num_queries x num_classes]
+               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
+                               (center_x, center_y, width, height). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
+                                dictionnaries containing the two above keys for each decoder layer.
+        """
+
+        # encoder texts
+        tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
+            samples.device
+        )
+        one_hot_token = tokenized
+        (
+            text_self_attention_masks,
+            position_ids,
+            cate_to_token_mask_list,
+        ) = generate_masks_with_special_tokens_and_transfer_map(
+            tokenized, self.specical_tokens, self.tokenizer
+        )
+
+        if text_self_attention_masks.shape[1] > self.max_text_len:
+            text_self_attention_masks = text_self_attention_masks[
+                                        :, : self.max_text_len, : self.max_text_len
+                                        ]
+            position_ids = position_ids[:, : self.max_text_len]
+            tokenized["input_ids"] = tokenized["input_ids"][:, : self.max_text_len]
+            tokenized["attention_mask"] = tokenized["attention_mask"][:, : self.max_text_len]
+            tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : self.max_text_len]
+
+        # extract text embeddings
+        if self.sub_sentence_present:
+            tokenized_for_encoder = {k: v for k, v in tokenized.items() if k != "attention_mask"}
+            tokenized_for_encoder["attention_mask"] = text_self_attention_masks
+            tokenized_for_encoder["position_ids"] = position_ids
+        else:
+            tokenized_for_encoder = tokenized
+
+        bert_output = self.bert(**tokenized_for_encoder)  # bs, 195, 768
+
+        encoded_text = self.feat_map(bert_output["last_hidden_state"])  # bs, 195, d_model
+        text_token_mask = tokenized.attention_mask.bool()  # bs, 195
+        # text_token_mask: True for nomask, False for mask
+        # text_self_attention_masks: True for nomask, False for mask
+
+        if encoded_text.shape[1] > self.max_text_len:
+            encoded_text = encoded_text[:, : self.max_text_len, :]
+            text_token_mask = text_token_mask[:, : self.max_text_len]
+            position_ids = position_ids[:, : self.max_text_len]
+            text_self_attention_masks = text_self_attention_masks[
+                                        :, : self.max_text_len, : self.max_text_len
+                                        ]
+
+        text_dict = {
+            "encoded_text": encoded_text,  # bs, 195, d_model
+            "text_token_mask": text_token_mask,  # bs, 195
+            "position_ids": position_ids,  # bs, 195
+            "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+        }
+
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, poss = self.backbone(samples)
+
+        if not frozen_mode:
+            with torch.no_grad():
+                clip_face_feat, gaze_face_feat = self.image_encoder(face)
+
+            scene_feat = features[2].tensors.detach()
+
+
+            text_features = self.text_encoder('direction')
+
+
+            logit_scale = self.temperature.exp()
+            logits = logit_scale * clip_face_feat @ text_features.t()
+            jit_probs = logits.softmax(dim=-1)
+            _, direction_cls = jit_probs.max(dim=-1)
+            # align
+            if not self.training:
+                head_direction_clses = []
+            head_direction_channel = get_head_direction_channel(head_channel, direction_cls, head_direction_clses,
+                                                                jit_probs)
+
+            adapter_scene_feature, scene_feat = self.scene_adapter(scene_feat)
+
+            adapter_head_feature = self.face_adapter(gaze_face_feat)
+
+            ratio = 0.2
+            gatector_scene_feature = ratio * adapter_scene_feature + (1 - ratio) * scene_feat
+
+            gatector_head_feature = ratio * adapter_head_feature + (1 - ratio) * gaze_face_feat
+
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.num_feature_levels > len(srcs):
+            _len_srcs = len(srcs)
+            for l in range(_len_srcs, self.num_feature_levels):
+                if l == _len_srcs:
+                    src = self.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                poss.append(pos_l)
+
+        input_query_bbox = input_query_label = attn_mask = dn_meta = None
+        hs, reference, hs_enc, ref_enc, init_box_proposal, od_memory, od_pos, od_mask = self.transformer(
+            srcs, masks, input_query_bbox, poss, input_query_label, attn_mask, text_dict
+        )
+
+
+
+
+        if not frozen_mode:
+            gaze_outputs, _ = self.gatector(gatector_scene_feature, head_direction_channel, gatector_head_feature, od_memory, od_pos, od_mask)
+
+        # deformable-detr-like anchor update
+        outputs_coord_list = []
+        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(
+            zip(reference[:-1], self.bbox_embed, hs)
+        ):
+            layer_delta_unsig = layer_bbox_embed(layer_hs)
+            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            outputs_coord_list.append(layer_outputs_unsig)
+        outputs_coord_list = torch.stack(outputs_coord_list)
+
+        # output
+        outputs_class = torch.stack(
+            [
+                layer_cls_embed(layer_hs, text_dict)
+                for layer_cls_embed, layer_hs in zip(self.class_embed, hs)
+            ]
+        )
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+
+        # Used to calculate losses
+        bs, len_td = text_dict['text_token_mask'].shape
+        out['text_mask'] = torch.zeros(bs, self.max_text_len, dtype=torch.bool).to(
+            samples.device
+        )
+        for b in range(bs):
+            for j in range(len_td):
+                if text_dict['text_token_mask'][b][j] == True:
+                    out['text_mask'][b][j] = True
+
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord_list)
+        out['token'] = one_hot_token
+
+        if hs_enc is not None:
+            # prepare intermediate outputs
+            interm_coord = ref_enc[-1]
+            interm_class = self.transformer.enc_out_class_embed(hs_enc[-1], text_dict)
+            out['interm_outputs'] = {'pred_logits': interm_class, 'pred_boxes': interm_coord}
+            out['interm_outputs_for_matching_pre'] = {'pred_logits': interm_class, 'pred_boxes': init_box_proposal}
+
+
+
+
+        if frozen_mode:
+            return hs, outputs_class
+        else:
+            return out, gaze_outputs, logits, hs, outputs_class    #, fusion_feat
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        return [
+            {"pred_logits": a, "pred_boxes": b}
+            for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+        ]
+
+
+class SetCriterion(nn.Module):
+    """ This class computes the loss for Conditional DETR.
+    The process happens in two steps:
+        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+    def __init__(self, num_classes, matcher, weight_dict, focal_alpha, focal_gamma, losses):
+        """ Create the criterion.
+        Parameters:
+            num_classes: number of object categories, omitting the special no-object category
+            matcher: module able to compute a matching between targets and proposals
+            weight_dict: dict containing as key the names of the losses and as values their relative weight.
+            losses: list of all the losses to be applied. See get_loss for list of available losses.
+            focal_alpha: alpha in Focal Loss
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.losses = losses
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
+        seen_id2name = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'train', 5: 'truck', 6: 'boat',
+                        7: 'bench',
+                        8: 'bird', 9: 'horse', 10: 'sheep', 11: 'bear', 12: 'zebra', 13: 'giraffe', 14: 'backpack',
+                        15: 'handbag', 16: 'suitcase', 17: 'frisbee', 18: 'skis', 19: 'sports ball', 20: 'kite',
+                        21: 'baseball bat', 22: 'baseball glove', 23: 'surfboard', 24: 'tennis racket', 25: 'bottle',
+                        26: 'wine glass', 27: 'fork', 28: 'spoon', 29: 'bowl', 30: 'banana', 31: 'apple',
+                        32: 'sandwich',
+                        33: 'orange', 34: 'broccoli', 35: 'carrot', 36: 'hot dog', 37: 'pizza', 38: 'donut',
+                        39: 'chair',
+                        40: 'bed', 41: 'dining table', 42: 'toilet', 43: 'tv', 44: 'laptop', 45: 'mouse', 46: 'remote',
+                        47: 'cell phone', 48: 'microwave', 49: 'oven', 50: 'toaster', 51: 'refrigerator', 52: 'book',
+                        53: 'clock', 54: 'vase', 55: 'teddy bear', 56: 'toothbrush', 57: 'head', 58: 'hand', 59: 'leg'}
+        classnames_object = [v for k, v in seen_id2name.items()]
+        self.clip_name2idx = {n: i for i, n in enumerate(classnames_object)}
+
+
+    @torch.no_grad()
+    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+        This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
+        """
+        pred_logits = outputs['pred_logits']
+        device = pred_logits.device
+        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        # Count the number of predictions that are NOT "no-object" (which is the last class)
+        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
+        losses = {'cardinality_error': card_err}
+        return losses
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+           The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        # calculate the x,y and h,w loss
+        with torch.no_grad():
+            losses['loss_xy'] = loss_bbox[..., :2].sum() / num_boxes
+            losses['loss_hw'] = loss_bbox[..., 2:].sum() / num_boxes
+
+
+        return losses
+
+    def token_sigmoid_binary_focal_loss(self, outputs, targets, indices, num_boxes):
+        pred_logits = outputs['pred_logits']
+        new_targets = outputs['one_hot'].to(pred_logits.device)
+        text_mask = outputs['text_mask']
+
+        assert (new_targets.dim() == 3)
+        assert (pred_logits.dim() == 3)  # batch x from x to
+
+        bs, n, _ = pred_logits.shape
+        alpha = self.focal_alpha
+        gamma = self.focal_gamma
+        if text_mask is not None:
+            # ODVG: each sample has different mask
+            text_mask = text_mask.repeat(1, pred_logits.size(1)).view(outputs['text_mask'].shape[0], -1,
+                                                                      outputs['text_mask'].shape[1])
+            pred_logits = torch.masked_select(pred_logits, text_mask)
+            new_targets = torch.masked_select(new_targets, text_mask)
+
+        new_targets = new_targets.float()
+        p = torch.sigmoid(pred_logits)
+        ce_loss = F.binary_cross_entropy_with_logits(pred_logits, new_targets, reduction="none")
+        p_t = p * new_targets + (1 - p) * (1 - new_targets)
+        loss = ce_loss * ((1 - p_t) ** gamma)
+
+        if alpha >= 0:
+            alpha_t = alpha * new_targets + (1 - alpha) * (1 - new_targets)
+            loss = alpha_t * loss
+
+        total_num_pos = 0
+        for batch_indices in indices:
+            total_num_pos += len(batch_indices[0])
+        num_pos_avg_per_gpu = max(total_num_pos, 1.0)
+        loss = loss.sum() / num_pos_avg_per_gpu
+
+        losses = {'loss_ce': loss}
+        return losses
+
+
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        loss_map = {
+            'labels': self.token_sigmoid_binary_focal_loss,
+            'cardinality': self.loss_cardinality,
+            'boxes': self.loss_boxes,
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def forward(self, outputs, targets, cat_list, caption, return_indices=False):
+        """ This performs the loss computation.
+        Parameters:
+             outputs: dict of tensors, see the output specification of the model for the format
+             targets: list of dicts, such that len(targets) == batch_size.
+                      The expected keys in each dict depends on the losses applied, see each loss' doc
+            
+             return_indices: used for vis. if True, the layer0-5 indices will be returned as well.
+
+        """
+        device = next(iter(outputs.values())).device
+        one_hot = torch.zeros(outputs['pred_logits'].size(), dtype=torch.int64)  # torch.Size([bs, 900, 256])
+        token = outputs['token']
+
+
+        label_map_list = []
+        indices = []
+        for j in range(len(cat_list)): # bs
+            label_map=[]
+            for i in range(len(cat_list[j])):
+                label_id=torch.tensor([i])
+                per_label=create_positive_map(token[j], label_id, cat_list[j], caption[j])
+                label_map.append(per_label)
+            label_map=torch.stack(label_map,dim=0).squeeze(1)
+            label_map_list.append(label_map)
+        for j in range(len(cat_list)): # bs
+            for_match = {
+                "pred_logits" : outputs['pred_logits'][j].unsqueeze(0),
+                "pred_boxes" : outputs['pred_boxes'][j].unsqueeze(0)
+            }
+            inds = self.matcher(for_match, [targets[j]], label_map_list[j])
+            indices.extend(inds)
+
+        tgt_ids = [v["labels"].cpu() for v in targets]
+
+        for i in range(len(indices)):
+            tgt_ids[i]=tgt_ids[i][indices[i][1]]
+            one_hot[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+        outputs['one_hot'] = one_hot
+        if return_indices:
+            indices0_copy = indices
+            indices_list = []
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        num_boxes_list = [len(t["labels"]) for t in targets]
+        num_boxes = sum(num_boxes_list)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # Compute all the requested losses
+        losses = {}
+
+
+        for loss in self.losses:
+            kwargs = {}
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, **kwargs))
+
+        # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        if 'aux_outputs' in outputs:
+            for idx, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = []
+                for j in range(len(cat_list)): # bs
+                    aux_output_single = {
+                        'pred_logits' : aux_outputs['pred_logits'][j].unsqueeze(0),
+                        'pred_boxes': aux_outputs['pred_boxes'][j].unsqueeze(0)
+                    }
+                    inds = self.matcher(aux_output_single, [targets[j]], label_map_list[j])
+                    indices.extend(inds)
+                one_hot_aux = torch.zeros(outputs['pred_logits'].size(),dtype=torch.int64)
+                tgt_ids = [v["labels"].cpu() for v in targets]
+                for i in range(len(indices)):
+                    tgt_ids[i]=tgt_ids[i][indices[i][1]]
+                    one_hot_aux[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+                aux_outputs['one_hot'] = one_hot_aux
+                aux_outputs['text_mask'] = outputs['text_mask']
+                if return_indices:
+                    indices_list.append(indices)
+                for loss in self.losses:
+                    kwargs = {}
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = {k + f'_{idx}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+
+
+        # interm_outputs loss
+        if 'interm_outputs' in outputs:
+            interm_outputs = outputs['interm_outputs']
+            indices = []
+            for j in range(len(cat_list)): # bs
+                interm_output_single = {
+                    'pred_logits' : interm_outputs['pred_logits'][j].unsqueeze(0),
+                    'pred_boxes': interm_outputs['pred_boxes'][j].unsqueeze(0)
+                }
+                inds = self.matcher(interm_output_single, [targets[j]], label_map_list[j])
+                indices.extend(inds)
+            one_hot_aux = torch.zeros(outputs['pred_logits'].size(),dtype=torch.int64)
+            tgt_ids = [v["labels"].cpu() for v in targets]
+            for i in range(len(indices)):
+                tgt_ids[i]=tgt_ids[i][indices[i][1]]
+                one_hot_aux[i,indices[i][0]] = label_map_list[i][tgt_ids[i]].to(torch.long)
+            interm_outputs['one_hot'] = one_hot_aux
+            interm_outputs['text_mask'] = outputs['text_mask']
+            if return_indices:
+                indices_list.append(indices)
+            for loss in self.losses:
+                kwargs = {}
+                l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_boxes, **kwargs)
+                l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
+
+        if return_indices:
+            indices_list.append(indices0_copy)
+            return losses, indices_list
+
+        return losses
+
+
+
+class PostProcess(nn.Module):
+    """ This module converts the model's output into the format expected by the coco api"""
+    def __init__(self, num_select=100,text_encoder_type='text_encoder_type', nms_iou_threshold=-1,use_coco_eval=False,args=None) -> None:
+        super().__init__()
+        self.num_select = num_select
+        self.tokenizer = get_tokenlizer.get_tokenlizer(text_encoder_type)
+        if args.use_coco_eval:
+            from pycocotools.coco import COCO
+            coco = COCO(args.coco_val_path)
+            category_dict = coco.loadCats(coco.getCatIds())
+            cat_list = [item['name'] for item in category_dict]
+        else:
+            cat_list=args.label_list
+        caption = " . ".join(cat_list) + ' .'
+        tokenized = self.tokenizer(caption, padding="longest", return_tensors="pt")
+        label_list = torch.arange(len(cat_list))
+        pos_map=create_positive_map(tokenized,label_list,cat_list,caption)
+        # build a mapping from label_id to pos_map
+        if args.use_coco_eval:
+            id_map = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 10: 11, 11: 12, 12: 13, 13: 14,
+                      14: 15, 15: 16, 16: 17, 17: 18, 18: 19, 19: 20, 20: 21, 21: 22, 22: 23, 23: 24, 24: 25, 25: 26,
+                      26: 27, 27: 28, 28: 29, 29: 30, 30: 31, 31: 32, 32: 33, 33: 34, 34: 35, 35: 36, 36: 37, 37: 38,
+                      38: 39, 39: 40, 40: 41, 41: 42, 42: 43, 43: 44, 44: 45, 45: 46, 46: 47, 47: 48, 48: 49, 49: 50,
+                      50: 51, 51: 52, 52: 53, 53: 54, 54: 55, 55: 56, 56: 57, 57: 58, 58: 59, 59: 60, 60: 61, 61: 62,
+                      62: 63, 63: 64, 64: 65, 65: 66, 66: 67, 67: 68, 68: 69, 69: 70, 70: 71, 71: 72, 72: 73, 73: 74,
+                      74: 75, 75: 76, 76: 77, 77: 78, 78: 79, 79: 80, 80: 81, 81: 82, 82: 83, 83: 84, 84: 85, 85: 86,}
+            new_pos_map = torch.zeros((87, 256))
+            for k, v in id_map.items():
+                new_pos_map[v] = pos_map[k]
+            pos_map=new_pos_map
+
+
+        self.nms_iou_threshold=nms_iou_threshold
+        self.positive_map = pos_map
+
+    @torch.no_grad()
+    def forward(self, outputs, target_sizes, not_to_xyxy=False, test=False):
+        """ Perform the computation
+        Parameters:
+            outputs: raw outputs of the model
+            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
+                          For evaluation, this must be the original image size (before any data augmentation)
+                          For visualization, this should be the image size after data augment, but before padding
+        """
+        num_select = self.num_select
+        out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
+
+        prob_to_token = out_logits.sigmoid()
+        pos_maps = self.positive_map.to(prob_to_token.device)
+        for label_ind in range(len(pos_maps)):
+            if pos_maps[label_ind].sum() != 0:
+                pos_maps[label_ind] = pos_maps[label_ind] / pos_maps[label_ind].sum()
+
+        prob_to_label = prob_to_token @ pos_maps.T
+
+        assert len(out_logits) == len(target_sizes)
+        assert target_sizes.shape[1] == 2
+
+        prob = prob_to_label
+        topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), num_select, dim=1)
+        scores = topk_values
+        topk_boxes = torch.div(topk_indexes, prob.shape[2], rounding_mode='trunc')
+        labels = topk_indexes % prob.shape[2]
+        if not_to_xyxy:
+            boxes = out_bbox
+        else:
+            boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+
+        if test:
+            assert not not_to_xyxy
+            boxes[:,:,2:] = boxes[:,:,2:] - boxes[:,:,:2]
+        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
+        
+        # and from relative [0, 1] to absolute [0, height] coordinates
+        img_h, img_w = target_sizes.unbind(1)
+        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1).to(boxes.device)
+        boxes = boxes * scale_fct[:, None, :]
+
+        if self.nms_iou_threshold > 0:
+            item_indices = [nms(b, s, iou_threshold=self.nms_iou_threshold) for b,s in zip(boxes, scores)]
+
+            results = [{'scores': s[i], 'labels': l[i], 'boxes': b[i]} for s, l, b, i in zip(scores, labels, boxes, item_indices)]
+        else:
+            results = [{'scores': s, 'labels': l, 'boxes': b} for s, l, b in zip(scores, labels, boxes)]
+        return results
+
+
+@MODULE_BUILD_FUNCS.registe_with_name(module_name='dino')
+def build_dino(args, classnames):
+    # the `num_classes` naming here is somewhat misleading.
+    # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
+    # is the maximum id for a class in your dataset. For example,
+    # COCO has a max_obj_id of 90, so we pass `num_classes` to be 91.
+    # As another example, for a dataset that has a single class with id 1,
+    # you should pass `num_classes` to be 2 (max_obj_id + 1).
+    # For more details on this, check the following discussion
+    # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
+    num_classes = args.num_classes
+    device = torch.device(args.device)
+    backbone = build_backbone(args)
+
+
+
+    transformer = build_transformer(args)
+
+    gatector = build_gatector(args)
+
+    try:
+        dec_pred_class_embed_share = args.dec_pred_class_embed_share
+    except:
+        dec_pred_class_embed_share = True
+    try:
+        dec_pred_bbox_embed_share = args.dec_pred_bbox_embed_share
+    except:
+        dec_pred_bbox_embed_share = True
+
+    model = DINO(
+        args,
+        backbone,
+        transformer,
+        gatector,
+        classnames,
+        num_queries=args.num_queries,
+        aux_loss=True,
+        iter_update=True,
+        query_dim=4,
+        num_feature_levels=args.num_feature_levels,
+        nheads=args.nheads,
+        # two stage
+        two_stage_type=args.two_stage_type,
+        dec_pred_bbox_embed_share=dec_pred_bbox_embed_share,
+        two_stage_class_embed_share=args.two_stage_class_embed_share,
+        two_stage_bbox_embed_share=args.two_stage_bbox_embed_share,
+        # box_share
+        num_patterns=args.num_patterns,
+        text_encoder_type=args.text_encoder_type,
+        sub_sentence_present=args.sub_sentence_present,
+        max_text_len=args.max_text_len,
+    )
+    matcher = build_matcher(args)
+
+    # prepare weight dict
+    weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
+    weight_dict['loss_giou'] = args.giou_loss_coef
+    clean_weight_dict_wo_dn = copy.deepcopy(weight_dict)
+
+    
+    clean_weight_dict = copy.deepcopy(weight_dict)
+
+    # TODO this is a hack
+    if args.aux_loss:
+        aux_weight_dict = {}
+        for i in range(args.dec_layers - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in clean_weight_dict.items()})
+        weight_dict.update(aux_weight_dict)
+
+    if args.two_stage_type != 'no':
+        interm_weight_dict = {}
+        try:
+            no_interm_box_loss = args.no_interm_box_loss
+        except:
+            no_interm_box_loss = False
+        _coeff_weight_dict = {
+            'loss_ce': 1.0,
+            'loss_bbox': 1.0 if not no_interm_box_loss else 0.0,
+            'loss_giou': 1.0 if not no_interm_box_loss else 0.0,
+        }
+        try:
+            interm_loss_coef = args.interm_loss_coef
+        except:
+            interm_loss_coef = 1.0
+        interm_weight_dict.update({k + f'_interm': v * interm_loss_coef * _coeff_weight_dict[k] for k, v in clean_weight_dict_wo_dn.items()})
+        weight_dict.update(interm_weight_dict)
+
+    losses = ['labels', 'boxes', 'cardinality']
+    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+                             focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma, losses=losses,
+                             )
+    criterion.to(device)
+    postprocessors = {'bbox': PostProcess(num_select=args.num_select, text_encoder_type=args.text_encoder_type, nms_iou_threshold=args.nms_iou_threshold, args=args)}
+
+    return model, criterion, postprocessors
+
+
+def create_positive_map(tokenized, tokens_positive,cat_list,caption):
+    """construct a map such that positive_map[i,j] = True iff box i is associated to token j"""
+    positive_map = torch.zeros((len(tokens_positive), 256), dtype=torch.float)
+
+    for j,label in enumerate(tokens_positive):
+
+        start_ind = caption.find(cat_list[label])
+        end_ind = start_ind + len(cat_list[label]) - 1
+        beg_pos = tokenized.char_to_token(start_ind)
+        try:
+            end_pos = tokenized.char_to_token(end_ind)
+        except:
+            end_pos = None
+        if end_pos is None:
+            try:
+                end_pos = tokenized.char_to_token(end_ind - 1)
+                if end_pos is None:
+                    end_pos = tokenized.char_to_token(end_ind - 2)
+            except:
+                end_pos = None
+        if beg_pos is None or end_pos is None:
+            continue
+        if beg_pos < 0 or end_pos < 0:
+            continue
+        if beg_pos > end_pos:
+            continue
+        positive_map[j,beg_pos: end_pos + 1].fill_(1)
+    return positive_map

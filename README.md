@@ -11,8 +11,8 @@ We introduce **DiSG (Diverse Scenes for Gaze Object Prediction)**, a real-image 
 <p align="center">
   <a href="https://arxiv.org/abs/2607.18827"> Paper</a> ·
   <a href="#disg-dataset"> DiSG Dataset</a> ·
-  <a href="#code-and-model-weights"> Code and Model Weights</a> ·
-  <a href="#citation"> Citation</a> ·
+  <a href="#ovgop-framework"> OVGOP Framework</a> ·
+  <a href="#citation"> Citation</a>
 </p>
 
 <p align="center">
@@ -25,8 +25,7 @@ We introduce **DiSG (Diverse Scenes for Gaze Object Prediction)**, a real-image 
 
 - [x] **2026-07-10** — Our paper was accepted by ACM Multimedia 2026.
 - [x] **2026-07-16** — The DiSG dataset was made available.
-- [ ] Uploading code and weights of compared methods for DiSG
-- [ ] Uploading code of our OVGOP framework
+- [x] **2026-10-08** - Code of our OVGOP framework is available in `ovgop/`.
 ---
 
 ## DiSG Dataset
@@ -38,10 +37,11 @@ We introduce **DiSG (Diverse Scenes for Gaze Object Prediction)**, a real-image 
 
 ### Download
 
-The DiSG package is available from two download mirrors:
+The DiSG package is available from three download mirrors:
 
 - 🌐 **Google Drive:** [Download DiSG](https://drive.google.com/file/d/1oH4tr66ZQLQvWkJnlaCosyetDs1zOxma/view?usp=sharing)
 - ☁️ **Baidu Netdisk:** [Download DiSG](https://pan.baidu.com/s/1aD86VRsDN9ki22WyIT8i5Q?pwd=disg) — access code: `disg`
+- 🤗 **Hugging Face:** [Download DiSG](https://huggingface.co/datasets/sensniu/DiSG)
 
 ### Dataset Statistics
 The released validation annotation contains **2,781 images**, **3,700 gaze-object annotations**, and all **86 categories**.
@@ -87,12 +87,83 @@ Bounding boxes use the COCO convention `[x, y, width, height]`, and all coordina
 
 ---
 
-## Code and Model Weights
+## OVGOP Framework
 
-The following components will be released as soon as possible:
+### Environment Setup
 
-- Code and model weights of our OVGOP 
-- Model weights of previous GOP methods
+The model requires an NVIDIA GPU, Python 3.7.11, PyTorch 1.10.0, torchvision 0.11.1, and CUDA Toolkit 11.3. Run all installation, compilation, training, and evaluation commands from the `ovgop/` subdirectory.
+
+Starting from the repository root:
+
+```bash
+cd ovgop
+
+conda create -n ovgop python=3.7.11 -y
+conda activate ovgop
+conda install pytorch=1.10.0 torchvision=0.11.1 cudatoolkit=11.3 -c pytorch -c conda-forge
+python -m pip install -r ../requirements.txt
+```
+
+Compile the deformable-attention CUDA extension. A CUDA Toolkit installation containing `nvcc` is required; set `CUDA_HOME` to its actual location:
+
+```bash
+export CUDA_HOME=/path/to/cuda-11.3
+python setup_groundingdino_ext.py build_ext --inplace
+python -c "from models.dino import _C; print('extension OK')"
+```
+
+### Data Preparation
+
+Download DiSG from the [dataset download links above](#download) and extract it with the following layout:
+
+```text
+/path/to/DiSG/
+├── train/
+├── val/
+└── annotations/
+    ├── ovgop_train.json
+    └── ovgop_val.json
+```
+
+> Replace `/path/to/DiSG` in the commands below with the absolute path to your dataset.
+
+### Model Weights
+
+Download the OVGOP checkpoint from [Google Drive](https://drive.google.com/file/d/1iGAaGDinqIQSXhXdhskqU14RCJPGyYh4/view?usp=drive_link).
+
+Create a checkpoint directory from within `ovgop/`:
+
+```bash
+mkdir -p checkpoints
+```
+
+Save the downloaded checkpoint as `checkpoints/ovgop_disg.pth` (that is, `ovgop/checkpoints/ovgop_disg.pth` relative to the repository root).
+
+### Evaluation on DiSG
+
+Evaluate the released OVGOP checkpoint on the complete DiSG validation set, including Base and Novel categories.
+
+```bash
+python main.py -c configs/disg_ovgop.py \
+  --eval \
+  --amp \
+  --resume checkpoints/ovgop_disg.pth \
+  --data-root /path/to/DiSG \
+  --output-dir outputs/disg_eval
+```
+
+Evaluation results are written to `outputs/disg_eval/` inside `ovgop/`.
+
+### Training
+
+To train OVGOP on DiSG:
+
+```bash
+bash start_train.sh \
+  --amp \
+  --data-root /path/to/DiSG \
+  --output-dir outputs/disg_ovgop
+```
 
 ## Citation
 

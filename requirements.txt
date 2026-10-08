@@ -1,0 +1,21 @@
+# Python 3.7.11. Install CUDA-enabled PyTorch 1.10.0 and torchvision 0.11.1
+# before this file; see README.md. Do not let pip choose a CPU-only torch build.
+numpy==1.21.2
+scipy==1.7.1
+opencv-python==4.12.0.88
+scikit-learn==1.0.1
+Pillow==8.4.0
+pycocotools==2.0.7
+matplotlib==3.4.3
+timm==0.9.12
+transformers==4.30.2
+huggingface-hub==0.16.4
+tokenizers==0.13.3
+tensorboard==2.11.2
+protobuf==3.20.3
+termcolor==2.3.0
+addict==2.4.0
+yapf==0.28.0
+ftfy==6.1.1
+regex==2024.4.16
+tqdm==4.62.3
